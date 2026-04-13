@@ -1,6 +1,16 @@
 # 🧠 NLP Micro-API
 
-A lightweight FastAPI service with three endpoints for health checks, extractive text summarization, and rule-based sentiment analysis — no ML libraries or GPU required.
+A lightweight FastAPI service with three endpoints for health checks, LLM-powered text summarization, and LLM-powered sentiment analysis — both powered by Claude (Anthropic).
+
+---
+
+## Setup
+
+Both the `/summarize` and `/analyze-sentiment` endpoints require an Anthropic API key. Get one at [console.anthropic.com](https://console.anthropic.com/) and set it as an environment variable:
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+```
 
 ---
 
@@ -22,7 +32,7 @@ curl https://your-app.onrender.com/health
 ```
 
 ### `POST /summarize`
-Extractive summarizer — picks the most information-dense sentences.
+LLM-powered summarizer — sends text to Claude and returns an abstractive summary.
 
 ```bash
 curl -X POST https://your-app.onrender.com/summarize \
@@ -36,14 +46,14 @@ curl -X POST https://your-app.onrender.com/summarize \
 ```json
 {
   "original_length": 370,
-  "summary_length": 119,
-  "compression_ratio": 0.32,
-  "summary": "Artificial intelligence has transformed many industries. Healthcare uses AI for diagnostics and drug discovery."
+  "summary_length": 105,
+  "compression_ratio": 0.28,
+  "summary": "AI is transforming industries including healthcare, finance, education, and transportation. Its future holds both significant promise and notable challenges."
 }
 ```
 
 ### `POST /analyze-sentiment`
-Rule-based sentiment analysis with negation and intensifier handling.
+LLM-powered sentiment analysis — sends text to Claude and returns a structured assessment with confidence score, explanation, and highlighted words.
 
 ```bash
 curl -X POST https://your-app.onrender.com/analyze-sentiment \
@@ -54,12 +64,12 @@ curl -X POST https://your-app.onrender.com/analyze-sentiment \
 ```json
 {
   "sentiment": "positive",
-  "confidence": 0.87,
-  "explanation": "The text leans positive — key signals include: amazing, easy. Minor negative notes: better.",
+  "confidence": 0.82,
+  "explanation": "The text is overwhelmingly positive, praising the product as 'amazing' and 'easy to use,' with only a minor critique about documentation.",
   "word_count": 17,
   "highlights": {
-    "positive": ["amazing", "easy"],
-    "negative": ["better"]
+    "positive": ["absolutely amazing", "very easy to use"],
+    "negative": ["documentation could be better"]
   }
 }
 ```
@@ -70,6 +80,7 @@ curl -X POST https://your-app.onrender.com/analyze-sentiment \
 
 ```bash
 pip install -r requirements.txt
+export ANTHROPIC_API_KEY="sk-ant-..."
 uvicorn main:app --reload
 ```
 
@@ -82,7 +93,8 @@ Open [http://localhost:8000](http://localhost:8000) for the interactive Swagger 
 1. Push this repo to GitHub.
 2. Go to [render.com](https://render.com) → **New** → **Blueprint**.
 3. Connect your GitHub repo — Render reads `render.yaml` automatically.
-4. Click **Apply** and wait for the build to finish.
+4. In the Render dashboard, add your `ANTHROPIC_API_KEY` under **Environment**.
+5. Click **Apply** and wait for the build to finish.
 
 Your API will be live at `https://nlp-micro-api.onrender.com`.
 
@@ -92,7 +104,7 @@ Your API will be live at `https://nlp-micro-api.onrender.com`.
 
 ```bash
 docker build -t nlp-micro-api .
-docker run -p 8000:8000 nlp-micro-api
+docker run -e ANTHROPIC_API_KEY="sk-ant-..." -p 8000:8000 nlp-micro-api
 ```
 
 ---
@@ -101,7 +113,7 @@ docker run -p 8000:8000 nlp-micro-api
 
 ```
 ├── main.py            # FastAPI app + all endpoint logic
-├── requirements.txt   # Python dependencies
+├── requirements.txt   # Python dependencies (fastapi, uvicorn, pydantic, httpx)
 ├── render.yaml        # Render deployment config
 ├── Dockerfile         # Container build (optional)
 ├── .gitignore

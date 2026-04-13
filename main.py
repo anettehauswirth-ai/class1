@@ -1,20 +1,24 @@
 """
 FastAPI NLP Micro-API
 ─────────────────────
-Three lightweight endpoints for health checks, text summarization,
-and sentiment analysis — no ML libraries required.
+Three lightweight endpoints for health checks, LLM-powered text
+summarization, and LLM-powered sentiment analysis — both via Claude.
 """
 
 from __future__ import annotations
 
-import re
-import math
+import os
+import json
+import logging
 from datetime import datetime, timezone
 from typing import Optional
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────
 # App setup
@@ -22,8 +26,8 @@ from pydantic import BaseModel, Field
 app = FastAPI(
     title="NLP Micro-API",
     description=(
-        "A tiny but mighty API that summarizes text and reads the room. "
-        "No GPU required — just good vibes and clever heuristics."
+        "A tiny but mighty API that summarizes text and analyses sentiment "
+        "— both powered by Claude. Brought to you by Anthropic."
     ),
     version="1.0.0",
     docs_url="/",           # Swagger UI lives at the root
@@ -68,185 +72,133 @@ class SentimentResponse(BaseModel):
 
 
 # ──────────────────────────────────────────────
-# Helpers — extractive summarizer
+# Helpers — LLM-powered summarizer (Claude)
 # ──────────────────────────────────────────────
-_SENTENCE_RE = re.compile(r'(?<=[.!?])\s+')
-
-def _split_sentences(text: str) -> list[str]:
-    """Split text into sentences (simple but effective)."""
-    return [s.strip() for s in _SENTENCE_RE.split(text.strip()) if s.strip()]
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
 
 
-def _word_frequencies(text: str) -> dict[str, int]:
-    words = re.findall(r"[a-zA-Z']+", text.lower())
-    stop = {
-        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "do", "does", "did", "will", "would", "could",
-        "should", "may", "might", "shall", "can", "need", "dare", "ought",
-        "to", "of", "in", "for", "on", "with", "at", "by", "from", "as",
-        "into", "through", "during", "before", "after", "above", "below",
-        "between", "out", "off", "over", "under", "again", "further", "then",
-        "once", "and", "but", "or", "nor", "not", "so", "yet", "both",
-        "either", "neither", "each", "every", "all", "any", "few", "more",
-        "most", "other", "some", "such", "no", "only", "own", "same", "than",
-        "too", "very", "just", "because", "if", "when", "while", "where",
-        "how", "what", "which", "who", "whom", "this", "that", "these",
-        "those", "i", "me", "my", "we", "our", "you", "your", "he", "him",
-        "his", "she", "her", "it", "its", "they", "them", "their",
-    }
-    freq: dict[str, int] = {}
-    for w in words:
-        if w not in stop and len(w) > 2:
-            freq[w] = freq.get(w, 0) + 1
-    return freq
+def _get_api_key() -> str:
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        raise HTTPException(
+            status_code=500,
+            detail="ANTHROPIC_API_KEY environment variable is not set.",
+        )
+    return key
 
 
-def summarize_text(text: str, max_sentences: int = 3) -> str:
-    """Extractive summarizer — picks the highest-scoring sentences."""
-    sentences = _split_sentences(text)
-    if len(sentences) <= max_sentences:
-        return text.strip()
+async def summarize_text(text: str, max_sentences: int = 3) -> str:
+    """Call the Anthropic API to produce an abstractive summary."""
+    api_key = _get_api_key()
 
-    freq = _word_frequencies(text)
-    if not freq:
-        return " ".join(sentences[:max_sentences])
+    prompt = (
+        f"Summarize the following text in at most {max_sentences} sentence(s). "
+        "Be concise and capture the key points. Return ONLY the summary, "
+        "no preamble or labels.\n\n"
+        f"{text}"
+    )
 
-    max_freq = max(freq.values())
-    norm = {w: c / max_freq for w, c in freq.items()}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            ANTHROPIC_API_URL,
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": ANTHROPIC_MODEL,
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        )
 
-    scored: list[tuple[float, int, str]] = []
-    for idx, sent in enumerate(sentences):
-        words = re.findall(r"[a-zA-Z']+", sent.lower())
-        score = sum(norm.get(w, 0) for w in words)
-        # Slight position bonus: earlier sentences matter more
-        position_bonus = 1.0 / (1 + idx * 0.1)
-        scored.append((score * position_bonus, idx, sent))
+    if resp.status_code != 200:
+        logger.error("Anthropic API error %s: %s", resp.status_code, resp.text)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Upstream LLM error ({resp.status_code}). Please try again.",
+        )
 
-    scored.sort(key=lambda x: x[0], reverse=True)
-    top = sorted(scored[:max_sentences], key=lambda x: x[1])
-    return " ".join(s for _, _, s in top)
+    data = resp.json()
+    # Extract text from the first content block
+    try:
+        return data["content"][0]["text"].strip()
+    except (KeyError, IndexError):
+        raise HTTPException(status_code=502, detail="Unexpected LLM response format.")
 
 
 # ──────────────────────────────────────────────
-# Helpers — rule-based sentiment analyser
+# Helpers — LLM-powered sentiment analyser
 # ──────────────────────────────────────────────
-_POSITIVE = {
-    "good", "great", "awesome", "excellent", "amazing", "wonderful",
-    "fantastic", "brilliant", "love", "loved", "loving", "happy",
-    "joy", "joyful", "pleased", "glad", "delighted", "enjoy",
-    "enjoyed", "enjoying", "beautiful", "perfect", "impressive",
-    "outstanding", "superb", "terrific", "marvelous", "pleasant",
-    "satisfied", "exciting", "excited", "thrilled", "grateful",
-    "thankful", "appreciate", "appreciated", "best", "better",
-    "win", "winning", "won", "success", "successful", "hope",
-    "hopeful", "optimistic", "incredible", "remarkable", "fabulous",
-    "like", "liked", "recommend", "recommended", "helpful",
-    "easy", "elegant", "friendly", "fun", "innovative", "intuitive",
-}
+async def analyze_sentiment(text: str) -> SentimentResponse:
+    """Call the Anthropic API to analyse sentiment."""
+    api_key = _get_api_key()
 
-_NEGATIVE = {
-    "bad", "terrible", "horrible", "awful", "worst", "hate", "hated",
-    "hating", "angry", "anger", "sad", "sadness", "disappointed",
-    "disappointing", "frustrating", "frustrated", "annoying",
-    "annoyed", "ugly", "poor", "poorly", "fail", "failed", "failure",
-    "boring", "bored", "dull", "pain", "painful", "unfortunately",
-    "unhappy", "upset", "broken", "useless", "waste", "wrong",
-    "problem", "problems", "issue", "issues", "difficult", "hard",
-    "worse", "nasty", "dreadful", "miserable", "pathetic", "sucks",
-    "rubbish", "trash", "lousy", "ridiculous", "stupid", "slow",
-    "crash", "crashed", "bug", "bugs", "error", "errors", "lacking",
-    "dislike", "disliked", "complex", "confusing", "ugly",
-}
-
-_NEGATORS = {"not", "no", "never", "neither", "nor", "barely", "hardly", "isn't", "aren't", "wasn't", "weren't", "don't", "doesn't", "didn't", "won't", "can't", "couldn't", "shouldn't", "wouldn't"}
-_INTENSIFIERS = {"very", "really", "extremely", "incredibly", "absolutely", "totally", "completely", "utterly", "highly", "especially", "remarkably", "so"}
-
-
-def analyze_sentiment(text: str) -> SentimentResponse:
-    words = re.findall(r"[a-zA-Z']+", text.lower())
-    word_count = len(words)
+    word_count = len(text.split())
     if word_count == 0:
         raise HTTPException(status_code=422, detail="Text contains no analysable words.")
 
-    pos_score = 0.0
-    neg_score = 0.0
-    pos_words: list[str] = []
-    neg_words: list[str] = []
+    prompt = (
+        "Analyse the sentiment of the following text. "
+        "Respond with ONLY a valid JSON object (no markdown, no backticks) "
+        "using exactly this schema:\n"
+        "{\n"
+        '  "sentiment": "positive" | "negative" | "neutral",\n'
+        '  "confidence": <float between 0.0 and 1.0>,\n'
+        '  "explanation": "<1-2 sentence explanation of why>",\n'
+        '  "highlights": {\n'
+        '    "positive": ["<word or phrase>", ...],\n'
+        '    "negative": ["<word or phrase>", ...]\n'
+        "  }\n"
+        "}\n\n"
+        f"Text to analyse:\n{text}"
+    )
 
-    for i, w in enumerate(words):
-        # Check if the previous word is a negator
-        negated = i > 0 and words[i - 1] in _NEGATORS
-        # Check for intensifier two words back or one word back
-        intensified = (
-            (i > 0 and words[i - 1] in _INTENSIFIERS)
-            or (i > 1 and words[i - 2] in _INTENSIFIERS)
-        )
-        weight = 1.5 if intensified else 1.0
-
-        if w in _POSITIVE:
-            if negated:
-                neg_score += weight
-                neg_words.append(f"not {w}")
-            else:
-                pos_score += weight
-                pos_words.append(w)
-        elif w in _NEGATIVE:
-            if negated:
-                pos_score += weight
-                pos_words.append(f"not {w}")
-            else:
-                neg_score += weight
-                neg_words.append(w)
-
-    total = pos_score + neg_score
-    if total == 0:
-        return SentimentResponse(
-            sentiment="neutral",
-            confidence=0.85,
-            explanation="No strong sentiment signals detected — the text appears neutral or factual.",
-            word_count=word_count,
-            highlights={"positive": [], "negative": []},
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            ANTHROPIC_API_URL,
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": ANTHROPIC_MODEL,
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": prompt}],
+            },
         )
 
-    if pos_score > neg_score:
-        sentiment = "positive"
-        ratio = pos_score / total
-    elif neg_score > pos_score:
-        sentiment = "negative"
-        ratio = neg_score / total
-    else:
-        sentiment = "neutral"
-        ratio = 0.5
-
-    # Map ratio to a confidence between 0.5 and 0.99
-    confidence = round(0.5 + 0.49 * (2 * ratio - 1) if ratio >= 0.5 else 0.5, 2)
-    # Boost confidence when there are many sentiment words
-    density = total / word_count
-    confidence = round(min(confidence + density * 0.15, 0.99), 2)
-
-    # Build human-readable explanation
-    if sentiment == "positive":
-        explanation = (
-            f"The text leans positive — key signals include: {', '.join(dict.fromkeys(pos_words))}."
-            + (f" Minor negative notes: {', '.join(dict.fromkeys(neg_words))}." if neg_words else "")
+    if resp.status_code != 200:
+        logger.error("Anthropic API error %s: %s", resp.status_code, resp.text)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Upstream LLM error ({resp.status_code}). Please try again.",
         )
-    elif sentiment == "negative":
-        explanation = (
-            f"The text leans negative — key signals include: {', '.join(dict.fromkeys(neg_words))}."
-            + (f" Some positive notes: {', '.join(dict.fromkeys(pos_words))}." if pos_words else "")
-        )
-    else:
-        explanation = "Mixed signals — the text contains roughly equal positive and negative indicators."
+
+    data = resp.json()
+    try:
+        raw_text = data["content"][0]["text"].strip()
+    except (KeyError, IndexError):
+        raise HTTPException(status_code=502, detail="Unexpected LLM response format.")
+
+    # Strip markdown fences if the model wraps them anyway
+    cleaned = raw_text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+
+    try:
+        result = json.loads(cleaned)
+    except json.JSONDecodeError:
+        logger.error("Failed to parse LLM JSON: %s", raw_text)
+        raise HTTPException(status_code=502, detail="LLM returned invalid JSON.")
 
     return SentimentResponse(
-        sentiment=sentiment,
-        confidence=confidence,
-        explanation=explanation,
+        sentiment=result.get("sentiment", "neutral"),
+        confidence=round(float(result.get("confidence", 0.5)), 2),
+        explanation=result.get("explanation", ""),
         word_count=word_count,
-        highlights={
-            "positive": list(dict.fromkeys(pos_words)),
-            "negative": list(dict.fromkeys(neg_words)),
-        },
+        highlights=result.get("highlights", {"positive": [], "negative": []}),
     )
 
 
@@ -265,14 +217,15 @@ def health_check():
 
 
 @app.post("/summarize", response_model=SummarizeResponse, tags=["NLP"])
-def summarize(req: SummarizeRequest):
+async def summarize(req: SummarizeRequest):
     """
-    Extractive text summarizer.
+    LLM-powered text summarizer.
 
-    Picks the most information-dense sentences from the input based on
-    word-frequency scoring with a positional bias toward earlier content.
+    Sends the input text to Claude (Anthropic API) and returns a concise
+    abstractive summary limited to the requested number of sentences.
+    Requires ANTHROPIC_API_KEY to be set as an environment variable.
     """
-    summary = summarize_text(req.text, max_sentences=req.max_length)
+    summary = await summarize_text(req.text, max_sentences=req.max_length)
     orig_len = len(req.text)
     summ_len = len(summary)
     return SummarizeResponse(
@@ -284,12 +237,13 @@ def summarize(req: SummarizeRequest):
 
 
 @app.post("/analyze-sentiment", response_model=SentimentResponse, tags=["NLP"])
-def sentiment(req: SentimentRequest):
+async def sentiment(req: SentimentRequest):
     """
-    Rule-based sentiment analyser.
+    LLM-powered sentiment analyser.
 
-    Scans for positive / negative lexicon hits, handles negation
-    (e.g. "not good" → negative) and intensifiers ("very bad" → stronger).
-    Returns sentiment label, confidence, and the words that drove the decision.
+    Sends the input text to Claude (Anthropic API) which returns a structured
+    JSON response with sentiment label, confidence score, explanation, and
+    the specific words/phrases that drove the decision.
+    Requires ANTHROPIC_API_KEY to be set as an environment variable.
     """
-    return analyze_sentiment(req.text)
+    return await analyze_sentiment(req.text)
